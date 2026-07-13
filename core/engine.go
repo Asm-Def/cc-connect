@@ -437,6 +437,7 @@ type Engine struct {
 	// Interactive agent session management
 	interactiveMu     sync.Mutex
 	interactiveStates map[string]*interactiveState // key = sessionKey
+	exclusiveCommands map[string]*interactiveState // session-exclusive direct command sentinel
 
 	platformLifecycleMu sync.Mutex
 	platformReady       map[Platform]bool
@@ -509,6 +510,7 @@ type interactiveState struct {
 	stopped                  bool
 	pending                  *pendingPermission
 	pendingMessages          []queuedMessage // messages queued while session was busy
+	exclusiveCommand         bool            // a session-exclusive direct command owns admission
 	approveAll               bool            // when true, auto-approve all permission requests for this session
 	fromVoice                bool            // true if current turn originated from voice transcription
 	sideText                 string
@@ -717,6 +719,7 @@ func NewEngine(name string, ag Agent, platforms []Platform, sessionStorePath str
 		skills:                NewSkillRegistry(),
 		aliases:               make(map[string]string),
 		interactiveStates:     make(map[string]*interactiveState),
+		exclusiveCommands:     make(map[string]*interactiveState),
 		sendWorkDirs:          make(map[string]string),
 		platformReady:         make(map[Platform]bool),
 		startedAt:             time.Now(),
@@ -1068,6 +1071,13 @@ func (e *Engine) GetSessions() *SessionManager {
 // AddCommand registers a custom slash command.
 func (e *Engine) AddCommand(name, description, prompt, exec, workDir, source string) {
 	e.commands.Add(name, description, prompt, exec, workDir, source)
+}
+
+// AddCommandWithOptions registers a custom slash command with opt-in execution
+// behavior. Runtime-added commands continue to use AddCommand and therefore
+// retain the upstream legacy shell behavior.
+func (e *Engine) AddCommandWithOptions(name, description, prompt, exec, workDir, source string, opts CustomCommandOptions) {
+	e.commands.AddWithOptions(name, description, prompt, exec, workDir, source, opts)
 }
 
 // ClearCommands removes all commands from the given source.
@@ -2926,7 +2936,11 @@ func (e *Engine) handleMessage(p Platform, msg *Message) {
 	// Without this, concurrent messages can observe the session as busy during
 	// startup but still find no state to queue into.
 	e.ensureInteractiveStateForQueueing(interactiveKey, p, msg.ReplyCtx)
-	if !session.TryLock() {
+	switch e.tryAdmitOrdinaryMessage(interactiveKey, session) {
+	case ordinaryAdmissionExclusive:
+		e.reply(p, msg.ReplyCtx, e.i18n.T(MsgSessionExclusiveBusy))
+		return
+	case ordinaryAdmissionBusy:
 		if e.stopCurrentMessageIfRecalled(interactiveKey) {
 			if e.waitForSessionLock(session, recalledStopLockWait) {
 				goto sessionLocked
@@ -2936,18 +2950,20 @@ func (e *Engine) handleMessage(p Platform, msg *Message) {
 		}
 		// Session is busy — try to queue the message for the running turn
 		// so the agent processes it immediately after the current turn ends.
-		if e.queueMessageForBusySession(p, msg, interactiveKey) {
+		handled, queued := e.queueMessageForBusySessionDetailed(p, msg, interactiveKey)
+		if handled {
 			// Race guard: the drain loop in processInteractiveMessageWith may
 			// have just finished (session unlocked) between our TryLock failure
 			// and the queue append. Re-try TryLock — if it succeeds, no one is
 			// draining the queue so we must start a processor ourselves.
-			if session.TryLock() {
+			if queued && session.TryLock() {
 				go e.drainOrphanedQueue(session, sessions, interactiveKey, agent, resolvedWorkspace)
 			}
 			return
 		}
 		e.reply(p, msg.ReplyCtx, e.i18n.T(MsgPreviousProcessing))
 		return
+	case ordinaryAdmissionAcquired:
 	}
 
 sessionLocked:
@@ -3039,11 +3055,25 @@ func (e *Engine) maybeAutoResetSessionOnIdle(p Platform, msg *Message, sessions 
 // the event loop sends it after the current turn's EventResult is received.
 // Returns true if the message was successfully queued, false otherwise.
 func (e *Engine) queueMessageForBusySession(p Platform, msg *Message, interactiveKey string) bool {
+	handled, _ := e.queueMessageForBusySessionDetailed(p, msg, interactiveKey)
+	return handled
+}
+
+// queueMessageForBusySessionDetailed reports separately whether the message
+// was handled and whether it was actually appended. Session-exclusive commands
+// reject ordinary messages without queueing, so callers must not start an
+// orphan-drain processor for that case.
+func (e *Engine) queueMessageForBusySessionDetailed(p Platform, msg *Message, interactiveKey string) (handled, queued bool) {
 	e.interactiveMu.Lock()
+	if e.exclusiveCommands[interactiveKey] != nil {
+		e.interactiveMu.Unlock()
+		e.reply(p, msg.ReplyCtx, e.i18n.T(MsgSessionExclusiveBusy))
+		return true, false
+	}
 	state, hasState := e.interactiveStates[interactiveKey]
 	if !hasState || state == nil {
 		e.interactiveMu.Unlock()
-		return false
+		return false, false
 	}
 	// Keep interactiveMu until state.mu is held. Otherwise a starting session can
 	// replace a placeholder state between lookup and queue append, losing the
@@ -3051,11 +3081,15 @@ func (e *Engine) queueMessageForBusySession(p Platform, msg *Message, interactiv
 	state.mu.Lock()
 	e.interactiveMu.Unlock()
 	defer state.mu.Unlock()
+	if state.exclusiveCommand {
+		e.reply(p, msg.ReplyCtx, e.i18n.T(MsgSessionExclusiveBusy))
+		return true, false
+	}
 
 	// Allow queueing when agentSession is nil (session is starting up,
 	// issue #565). Only reject if the session was established and died.
 	if state.agentSession != nil && !state.agentSession.Alive() {
-		return false
+		return false, false
 	}
 
 	// Only queue metadata — do NOT send to agent stdin yet.
@@ -3066,12 +3100,12 @@ func (e *Engine) queueMessageForBusySession(p Platform, msg *Message, interactiv
 	if e.isStaleUserMessageLocked(state, msg.UserMessageTimeMs) {
 		snap := userMessageWatermarkSnapshotLocked(state)
 		e.logStaleUserMessageDropped("reject_before_queue", msg, interactiveKey, snap)
-		return true
+		return true, false
 	}
 	if len(state.pendingMessages) >= e.maxQueuedMessages {
 		depth := len(state.pendingMessages)
 		e.reply(p, msg.ReplyCtx, fmt.Sprintf(e.i18n.T(MsgQueueFull), depth))
-		return true // handled: queue-full reply sent
+		return true, false // handled: queue-full reply sent
 	}
 	state.pendingMessages = append(state.pendingMessages, queuedMessage{
 		messageID:         msg.MessageID,
@@ -3104,7 +3138,7 @@ func (e *Engine) queueMessageForBusySession(p Platform, msg *Message, interactiv
 		"queue_depth", queueDepth,
 	)
 	e.reply(p, msg.ReplyCtx, e.i18n.T(MsgMessageQueued))
-	return true
+	return true, true
 }
 
 // ensureInteractiveStateForQueueing creates a placeholder interactiveState
@@ -6306,7 +6340,7 @@ func (e *Engine) handleCommand(p Platform, msg *Message, raw string) bool {
 			slog.Info("audit: command_executed",
 				"user_id", msg.UserID, "platform", msg.Platform,
 				"project", e.name, "command", custom.Name, "type", "custom")
-			e.executeCustomCommand(p, msg, custom, args)
+			e.executeCustomCommand(p, msg, custom, args, rawCommandSuffix(raw))
 			return true
 		}
 		if skill := e.skills.Resolve(cmd); skill != nil {
@@ -14211,13 +14245,17 @@ func (e *Engine) renderHeartbeatCard() *Card {
 // Custom command execution & management
 // ──────────────────────────────────────────────────────────────
 
-func (e *Engine) executeCustomCommand(p Platform, msg *Message, cmd *CustomCommand, args []string) {
+func (e *Engine) executeCustomCommand(p Platform, msg *Message, cmd *CustomCommand, args []string, rawSuffix string) {
 	if cmd.Exec != "" && !e.isAdmin(msg.UserID) {
 		e.reply(p, msg.ReplyCtx, fmt.Sprintf(e.i18n.T(MsgAdminRequired), "/"+cmd.Name))
 		return
 	}
 	// If this is an exec command, run shell command directly
 	if cmd.Exec != "" {
+		if cmd.ExecMode == "direct" {
+			e.executeDirectCommand(p, msg, cmd, rawSuffix)
+			return
+		}
 		go e.executeShellCommand(p, msg, cmd, args)
 		return
 	}

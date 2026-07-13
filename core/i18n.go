@@ -172,6 +172,7 @@ const (
 	MsgSessionCancelled          MsgKey = "session_cancelled"
 	MsgNoExecution               MsgKey = "no_execution"
 	MsgPreviousProcessing        MsgKey = "previous_processing"
+	MsgSessionExclusiveBusy      MsgKey = "session_exclusive_busy"
 	MsgQueueFull                 MsgKey = "queue_full"
 	MsgMessageQueued             MsgKey = "message_queued"
 	MsgNoToolsAllowed            MsgKey = "no_tools_allowed"
@@ -438,6 +439,7 @@ const (
 	MsgCommandExecTimeout MsgKey = "command_exec_timeout"
 	MsgCommandExecError   MsgKey = "command_exec_error"
 	MsgCommandExecSuccess MsgKey = "command_exec_success"
+	MsgDirectCommandOutputTruncated MsgKey = "direct_command_output_truncated"
 
 	MsgSkillsTitle            MsgKey = "skills_title"
 	MsgSkillsEmpty            MsgKey = "skills_empty"
@@ -736,6 +738,13 @@ var messages = map[MsgKey]map[Language]string{
 		LangTraditionalChinese: "⏳ 上一個請求仍在處理中。使用 `/ps <訊息>` 可向正在執行的任務追加補充資訊。",
 		LangJapanese:           "⏳ 前のリクエストを処理中です。`/ps <メッセージ>` で実行中のタスクに補足情報を送れます。",
 		LangSpanish:            "⏳ La solicitud anterior aún se está procesando. Use `/ps <mensaje>` para enviar un P.S. a la tarea en curso.",
+	},
+	MsgSessionExclusiveBusy: {
+		LangEnglish:            "⏳ A session command is running. Please retry after it finishes; this message was not queued.",
+		LangChinese:            "⏳ 会话命令正在执行。请在完成后重试；本消息未进入队列。",
+		LangTraditionalChinese: "⏳ 工作階段命令正在執行。請在完成後重試；本訊息未進入佇列。",
+		LangJapanese:           "⏳ セッションコマンドを実行中です。完了後に再試行してください。このメッセージはキューに入りませんでした。",
+		LangSpanish:            "⏳ Se está ejecutando un comando de sesión. Reinténtelo cuando termine; este mensaje no se puso en cola.",
 	},
 	MsgMessageQueued: {
 		LangEnglish:            "📬 Message received — will process after the current task finishes.",
@@ -2852,6 +2861,13 @@ var messages = map[MsgKey]map[Language]string{
 		LangTraditionalChinese: "✅ 命令執行成功（無輸出）。",
 		LangJapanese:           "✅ コマンドが正常に実行されました（出力なし）。",
 		LangSpanish:            "✅ Comando ejecutado exitosamente (sin salida).",
+	},
+	MsgDirectCommandOutputTruncated: {
+		LangEnglish:            "[output truncated]",
+		LangChinese:            "[输出已截断]",
+		LangTraditionalChinese: "[輸出已截斷]",
+		LangJapanese:           "[出力は切り詰められました]",
+		LangSpanish:            "[salida truncada]",
 	},
 	MsgSkillsTitle: {
 		LangEnglish:            "📋 Available Skills (%s) — %d skill(s)\n\n",

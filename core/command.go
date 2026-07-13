@@ -12,12 +12,22 @@ import (
 
 // CustomCommand represents a registered slash command (from config or agent command files).
 type CustomCommand struct {
-	Name        string // command name without leading "/"
-	Description string
-	Prompt      string // template with {{1}}, {{2}}, {{2*}}, {{args}} placeholders
-	Exec        string // shell command to execute (mutually exclusive with Prompt)
-	WorkDir     string // optional: working directory for exec command
-	Source      string // "config" or "agent" (for display)
+	Name             string // command name without leading "/"
+	Description      string
+	Prompt           string // template with {{1}}, {{2}}, {{2*}}, {{args}} placeholders
+	Exec             string // shell command or absolute direct executable (mutually exclusive with Prompt)
+	WorkDir          string // optional: working directory for exec command
+	ExecMode         string // empty means legacy shell; "direct" means argv without a shell
+	SessionExclusive bool   // direct command requires an idle logical session
+	Source           string // "config" or "agent" (for display)
+}
+
+// CustomCommandOptions contains opt-in execution behavior. Keeping this
+// separate lets existing runtime command-management APIs retain their legacy
+// shell behavior while config-backed commands can enable safer direct mode.
+type CustomCommandOptions struct {
+	ExecMode         string
+	SessionExclusive bool
 }
 
 // CommandRegistry holds all available custom commands and resolves agent command files.
@@ -35,15 +45,22 @@ func NewCommandRegistry() *CommandRegistry {
 
 // Add registers a custom command.
 func (r *CommandRegistry) Add(name, description, prompt, exec, workDir, source string) {
+	r.AddWithOptions(name, description, prompt, exec, workDir, source, CustomCommandOptions{})
+}
+
+// AddWithOptions registers a custom command with opt-in execution behavior.
+func (r *CommandRegistry) AddWithOptions(name, description, prompt, exec, workDir, source string, opts CustomCommandOptions) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	r.commands[strings.ToLower(name)] = &CustomCommand{
-		Name:        name,
-		Description: description,
-		Prompt:      prompt,
-		Exec:        exec,
-		WorkDir:     workDir,
-		Source:      source,
+		Name:             name,
+		Description:      description,
+		Prompt:           prompt,
+		Exec:             exec,
+		WorkDir:          workDir,
+		ExecMode:         strings.ToLower(strings.TrimSpace(opts.ExecMode)),
+		SessionExclusive: opts.SessionExclusive,
+		Source:           source,
 	}
 }
 

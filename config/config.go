@@ -600,11 +600,13 @@ type AliasConfig struct {
 
 // CommandConfig defines a user-customizable slash command that expands a prompt template or executes a shell command.
 type CommandConfig struct {
-	Name        string `toml:"name"`
-	Description string `toml:"description"`
-	Prompt      string `toml:"prompt"`   // prompt template (mutually exclusive with Exec)
-	Exec        string `toml:"exec"`     // shell command to execute (mutually exclusive with Prompt)
-	WorkDir     string `toml:"work_dir"` // optional: working directory for exec command
+	Name             string `toml:"name"`
+	Description      string `toml:"description"`
+	Prompt           string `toml:"prompt"`                      // prompt template (mutually exclusive with Exec)
+	Exec             string `toml:"exec"`                        // shell command or direct executable (mutually exclusive with Prompt)
+	WorkDir          string `toml:"work_dir"`                    // optional: working directory for exec command
+	ExecMode         string `toml:"exec_mode,omitempty"`         // optional: "direct" passes raw argv without a shell
+	SessionExclusive bool   `toml:"session_exclusive,omitempty"` // direct command must run while its logical session is idle
 }
 
 type LogConfig struct {
@@ -996,6 +998,24 @@ func (c *Config) validate() error {
 func (c *Config) validateInternal(permissive bool) error {
 	if err := validateDisplayConfig("display", &c.Display); err != nil {
 		return err
+	}
+	for i, command := range c.Commands {
+		prefix := fmt.Sprintf("commands[%d]", i)
+		execMode := strings.ToLower(strings.TrimSpace(command.ExecMode))
+		if execMode != "" && execMode != "direct" {
+			return fmt.Errorf("config: %s.exec_mode must be \"direct\" or omitted", prefix)
+		}
+		if execMode == "direct" {
+			if strings.TrimSpace(command.Exec) == "" || command.Prompt != "" {
+				return fmt.Errorf("config: %s direct mode requires exec and forbids prompt", prefix)
+			}
+			if strings.Contains(command.Exec, "{{") || strings.Contains(command.Exec, "}}") {
+				return fmt.Errorf("config: %s direct mode forbids exec templates", prefix)
+			}
+		}
+		if command.SessionExclusive && execMode != "direct" {
+			return fmt.Errorf("config: %s.session_exclusive requires exec_mode = \"direct\"", prefix)
+		}
 	}
 	switch strings.ToLower(strings.TrimSpace(c.AttachmentSend)) {
 	case "", "on", "off":

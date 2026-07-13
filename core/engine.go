@@ -3960,6 +3960,26 @@ func (e *Engine) getOrCreateInteractiveStateWith(sessionKey string, p Platform, 
 	if ccSessionKey != "" {
 		ccKey = ccSessionKey
 	}
+	sessionNamespace := ""
+	if _, contextual := agent.(ContextualSessionStarter); contextual {
+		var err error
+		sessionNamespace, err = SessionNamespace(sessions)
+		if err != nil {
+			slog.Error("failed to derive stable session namespace", "error", err)
+			newState := &interactiveState{platform: p, replyCtx: replyCtx, agent: agent, eventsNeedResync: true}
+			adoptPendingFromPlaceholder(e.interactiveStates[sessionKey], newState)
+			e.interactiveStates[sessionKey] = newState
+			return newState
+		}
+	}
+	sessionContext := SessionStartContext{
+		Project:          e.name,
+		SessionKey:       ccKey,
+		SessionNamespace: sessionNamespace,
+		LogicalSessionID: session.ID,
+		AgentType:        agent.Name(),
+		DataDir:          e.dataDir,
+	}
 
 	// Inject per-session env vars so the agent subprocess can call `cc-connect cron add` etc.
 	if inj, ok := agent.(SessionEnvInjector); ok {
@@ -4031,11 +4051,13 @@ func (e *Engine) getOrCreateInteractiveStateWith(sessionKey string, p Platform, 
 	}
 	isResume := startSessionID != ""
 	startAt := time.Now()
-	agentSession, err := agent.StartSession(e.ctx, startSessionID)
+	agentSession, contextualStart, err := startAgentSession(e.ctx, agent, startSessionID, sessionContext)
 	startElapsed := time.Since(startAt)
 	if err != nil {
-		// If resume/continue failed, try a fresh session as fallback.
-		if startSessionID != "" {
+		// Legacy adapters retain the upstream resume-to-fresh fallback. An
+		// adapter opting into ContextualSessionStarter owns the supplied resume
+		// ID strictly: preserve the ID/history on error and never start fresh.
+		if startSessionID != "" && !contextualStart {
 			slog.Error("session resume failed, falling back to fresh session",
 				"session_key", sessionKey, "failed_session_id", startSessionID,
 				"error", err, "elapsed", startElapsed)
@@ -4044,7 +4066,7 @@ func (e *Engine) getOrCreateInteractiveStateWith(sessionKey string, p Platform, 
 			session.SetAgentSessionID("", agent.Name())
 			sessions.Save()
 			startAt = time.Now()
-			agentSession, err = agent.StartSession(e.ctx, "")
+			agentSession, _, err = startAgentSession(e.ctx, agent, "", sessionContext)
 			startElapsed = time.Since(startAt)
 			if err == nil {
 				slog.Info("fresh session started after resume failure",
@@ -15466,6 +15488,22 @@ func (e *Engine) relayContextForSourceSessionKey(fromProject, sourceSessionKey s
 	return agent, sessions, relaySessionKey, nil
 }
 
+// startAgentSession selects the optional atomic start path while preserving
+// legacy behavior for adapters that do not implement it. The bool reports
+// contextual ownership even when the start itself fails.
+func startAgentSession(ctx context.Context, agent Agent, sessionID string, sessionContext SessionStartContext) (AgentSession, bool, error) {
+	if starter, ok := agent.(ContextualSessionStarter); ok {
+		session, err := starter.StartSessionWithContext(ctx, sessionID, sessionContext)
+		if errors.Is(err, ErrContextualStartUnsupported) {
+			session, legacyErr := agent.StartSession(ctx, sessionID)
+			return session, false, legacyErr
+		}
+		return session, true, err
+	}
+	session, err := agent.StartSession(ctx, sessionID)
+	return session, false, err
+}
+
 // HandleRelay processes a relay message synchronously: starts or resumes a
 // dedicated relay session, sends the message to the agent, and blocks until
 // the complete response is collected (or the relay context times out).
@@ -15475,6 +15513,21 @@ func (e *Engine) HandleRelay(ctx context.Context, fromProject, sourceSessionKey,
 		return "", err
 	}
 	session := sessions.GetOrCreateActive(relaySessionKey)
+	sessionNamespace := ""
+	if _, contextual := agent.(ContextualSessionStarter); contextual {
+		sessionNamespace, err = SessionNamespace(sessions)
+		if err != nil {
+			return "", err
+		}
+	}
+	sessionContext := SessionStartContext{
+		Project:          e.name,
+		SessionKey:       sourceSessionKey,
+		SessionNamespace: sessionNamespace,
+		LogicalSessionID: session.ID,
+		AgentType:        agent.Name(),
+		DataDir:          e.dataDir,
+	}
 
 	if inj, ok := agent.(SessionEnvInjector); ok {
 		envVars := []string{
@@ -15493,16 +15546,17 @@ func (e *Engine) HandleRelay(ctx context.Context, fromProject, sourceSessionKey,
 	// Use the engine context (not the relay timeout context) so that the
 	// agent process is not killed when the relay deadline fires. The relay
 	// timeout only controls how long we *wait* for the response.
-	agentSession, err := agent.StartSession(e.ctx, session.GetAgentSessionID())
+	resumeID := session.GetAgentSessionID()
+	agentSession, contextualStart, err := startAgentSession(e.ctx, agent, resumeID, sessionContext)
 	if err != nil {
 		// Resume failed — fall back to a fresh session so the relay is not
 		// permanently broken by a corrupted/stale session ID.
-		if session.GetAgentSessionID() != "" {
+		if resumeID != "" && !contextualStart {
 			slog.Warn("relay: session resume failed, trying fresh session",
 				"relay_key", relaySessionKey, "error", err)
 			session.SetAgentSessionID("", agent.Name())
 			sessions.Save()
-			agentSession, err = agent.StartSession(e.ctx, "")
+			agentSession, _, err = startAgentSession(e.ctx, agent, "", sessionContext)
 		}
 		if err != nil {
 			return "", fmt.Errorf("start relay session: %w", err)

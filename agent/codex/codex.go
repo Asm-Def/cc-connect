@@ -420,6 +420,26 @@ func (a *Agent) SetSessionEnv(env []string) {
 }
 
 func (a *Agent) StartSession(ctx context.Context, sessionID string) (core.AgentSession, error) {
+	return a.startSession(ctx, sessionID, nil)
+}
+
+// StartSessionWithContext snapshots caller identity into this one Codex
+// session. The call-local values are appended last so they override stale
+// daemon or shared SessionEnv values without mutating Agent state.
+func (a *Agent) StartSessionWithContext(ctx context.Context, sessionID string, sessionContext core.SessionStartContext) (core.AgentSession, error) {
+	a.mu.RLock()
+	backend := a.backend
+	a.mu.RUnlock()
+	if backend == "app_server" {
+		return nil, core.ErrContextualStartUnsupported
+	}
+	if !core.ValidSessionNamespace(sessionContext.SessionNamespace) {
+		return nil, fmt.Errorf("codex: stable session namespace is required")
+	}
+	return a.startSession(ctx, sessionID, sessionContext.Environment())
+}
+
+func (a *Agent) startSession(ctx context.Context, sessionID string, callEnv []string) (core.AgentSession, error) {
 	a.mu.Lock()
 	mode := a.mode
 	model := a.model
@@ -435,10 +455,15 @@ func (a *Agent) StartSession(ctx context.Context, sessionID string) (core.AgentS
 	// Order matters for MergeEnv override semantics (later wins):
 	//   1. configEnv — static env from [projects.agent.options.env]
 	//   2. providerEnv — per-provider keys (OPENAI_API_KEY etc.)
-	//   3. sessionEnv — runtime overrides from /env or admin actions
+	//   3. sessionEnv — legacy runtime overrides from /env or admin actions
+	//   4. callEnv — immutable context for this StartSession call
 	extraEnv := append([]string(nil), a.configEnv...)
 	extraEnv = append(extraEnv, a.providerEnvLocked()...)
 	extraEnv = append(extraEnv, a.sessionEnv...)
+	// Merge rather than append so reserved CC_* keys appear exactly once.
+	// os.Getenv uses the first duplicate on Linux, so a stale shared value
+	// before callEnv would otherwise defeat the atomic context contract.
+	extraEnv = core.MergeEnv(extraEnv, callEnv)
 	var baseURL string
 	if a.activeIdx >= 0 && a.activeIdx < len(a.providers) {
 		if m := a.providers[a.activeIdx].Model; m != "" {

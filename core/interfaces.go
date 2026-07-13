@@ -48,6 +48,46 @@ type SessionEnvInjector interface {
 	SetSessionEnv(env []string)
 }
 
+// SessionStartContext is immutable caller context for one Agent session
+// creation. It is intentionally limited to routing identity; prompts, history,
+// credentials, and provider selection do not belong in this contract.
+type SessionStartContext struct {
+	Project          string
+	SessionKey       string
+	SessionNamespace string
+	LogicalSessionID string
+	AgentType        string
+	DataDir          string
+}
+
+// Environment returns a fresh environment slice for the call-local context.
+// Later entries override inherited variables through MergeEnv.
+func (c SessionStartContext) Environment() []string {
+	env := []string{
+		"CC_PROJECT=" + c.Project,
+		"CC_SESSION_KEY=" + c.SessionKey,
+		"CC_SESSION_NAMESPACE=" + c.SessionNamespace,
+		"CC_LOGICAL_SESSION_ID=" + c.LogicalSessionID,
+		"CC_AGENT_TYPE=" + c.AgentType,
+	}
+	if c.DataDir != "" {
+		env = append(env, "CC_DATA_DIR="+c.DataDir)
+	}
+	return env
+}
+
+// ContextualSessionStarter atomically accepts the backend resume ID and its
+// immutable caller context. Implementations opt in; all other agents retain
+// the legacy StartSession behavior.
+type ContextualSessionStarter interface {
+	StartSessionWithContext(ctx context.Context, sessionID string, sessionContext SessionStartContext) (AgentSession, error)
+}
+
+// ErrContextualStartUnsupported lets an Agent type conditionally decline the
+// optional capability for one backend. The engine then uses legacy
+// StartSession semantics, including its existing resume fallback behavior.
+var ErrContextualStartUnsupported = errors.New("contextual session start unsupported")
+
 // FormattingInstructionProvider is an optional interface for platforms that
 // provide platform-specific formatting instructions for the agent system prompt
 // (e.g., Slack mrkdwn vs standard Markdown).

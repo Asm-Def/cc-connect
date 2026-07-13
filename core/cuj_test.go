@@ -33,6 +33,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
@@ -562,6 +563,71 @@ func TestCUJ_D7_OutgoingRateLimitThrottlesBurst(t *testing.T) {
 	// All messages must eventually arrive (no drops).
 	if got := len(env.plat.getSent()); got != N {
 		t.Fatalf("sent count = %d, want %d (limiter must throttle, not drop)", got, N)
+	}
+}
+
+// ===========================================================================
+// CUJ-D8 · A configured session-exclusive direct command owns one logical
+// session atomically. Ordinary messages racing the command are rejected (not
+// queued), and the next post-command message continues the same session.
+// ===========================================================================
+
+func TestCUJ_D8_SessionExclusiveDirectCommandRejectsRacingTurn(t *testing.T) {
+	env := newCUJEnv(t)
+	env.engine.SetAdminFrom("*")
+	command := secureTestExecutable(t, `
+printf started > "$1"
+while [ ! -f "$2" ]; do :; done
+printf route-complete
+`)
+	started := filepath.Join(filepath.Dir(command), "started")
+	release := filepath.Join(filepath.Dir(command), "release")
+	env.engine.AddCommandWithOptions("route", "", "", command, "", "config", CustomCommandOptions{
+		ExecMode: "direct", SessionExclusive: true,
+	})
+
+	// Action 1: create a named logical session.
+	env.userSends("route-user", "/new routed")
+	env.waitFor("new session reply", 2*time.Second, func() bool { return len(env.plat.getSent()) > 0 })
+	sessionKey := "test:route-user"
+	logical := env.activeSession(sessionKey)
+	env.plat.clearSent()
+
+	// Action 2: acquire the session-exclusive command sentinel.
+	env.userSends("route-user", "/route "+started+" "+release)
+	env.waitFor("direct command start", 2*time.Second, func() bool {
+		_, err := os.Stat(started)
+		return err == nil
+	})
+
+	// Action 3: an ordinary message races the command. The user must see an
+	// explicit retry/no-queue result, and the LLM history must not change.
+	env.userSends("route-user", "must not be queued")
+	env.waitFor("exclusive retry reply", 2*time.Second, func() bool {
+		return env.sentContains("not queued")
+	})
+	for _, entry := range logical.GetHistory(0) {
+		if strings.Contains(entry.Content, "must not be queued") {
+			t.Fatalf("racing message entered history: %#v", logical.GetHistory(0))
+		}
+	}
+
+	// Action 4: let the command reach terminal success and release admission.
+	if err := os.WriteFile(release, []byte("release"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	env.waitFor("direct command terminal reply", 2*time.Second, func() bool {
+		return env.sentContains("route-complete")
+	})
+
+	// Action 5: the next ordinary message proceeds on the same logical session.
+	env.plat.clearSent()
+	env.userSends("route-user", "after route")
+	env.waitFor("post-route LLM reply", 2*time.Second, func() bool {
+		return env.sentContains("ok")
+	})
+	if got := env.activeSession(sessionKey).ID; got != logical.ID {
+		t.Fatalf("logical session changed: got %q, want %q", got, logical.ID)
 	}
 }
 
@@ -2008,4 +2074,3 @@ func TestCUJ_H2_TwoPlatformsConcurrentNoBleed(t *testing.T) {
 		t.Fatal("platB received no replies")
 	}
 }
-

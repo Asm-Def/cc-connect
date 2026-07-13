@@ -1,0 +1,13 @@
+{
+  "name": "cc-connect-session-context-fork-build",
+  "version": "1.0.0",
+  "private": true,
+  "packageManager": "pnpm@10.33.1",
+  "scripts": {
+    "build": "node tools/sessionctx/build.mjs",
+    "pack:local": "node tools/sessionctx/pack.mjs",
+    "scope:check": "sh tools/sessionctx/scope-check.sh",
+    "test:package": "node --test tools/sessionctx/*.test.mjs",
+    "test:sessionctx": "node tools/sessionctx/test-suite.mjs"
+  }
+}
